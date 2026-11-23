@@ -61,18 +61,52 @@ def main():
   X_va = torch.tensor(scaler.transform(X_va_raw), device=device)
   X_te = torch.tensor(scaler.transform(X_te_raw), device=device)
 
-  model = ConstructiveMultiFloorNet(
-      n_floors=3, top_k_per_floor=8, beam_candidates=32, seed=42
+  # 1. Uniform-Weight ConstructiveMultiFloorNet
+  model_base = ConstructiveMultiFloorNet(
+      n_floors=3, top_k_per_floor=8, beam_candidates=32, focus_power=0.0, seed=42
   ).to(device)
-  model.fit(X_tr, y_tr, X_va, y_va)
+  model_base.fit(X_tr, y_tr, X_va, y_va)
+  probs_base = model_base.predict_proba(X_te).cpu().numpy()
 
-  probs = model.predict_proba(X_te).cpu().numpy()
-  auc = roc_auc_score(y_te, probs)
-  acc = accuracy_score(y_te, probs > 0.5) * 100.0
+  # 2. Error-Reweighted ConstructiveMultiFloorNet
+  model_err = ConstructiveMultiFloorNet(
+      n_floors=3, top_k_per_floor=8, beam_candidates=32, focus_power=2.5, seed=42
+  ).to(device)
+  model_err.fit(X_tr, y_tr, X_va, y_va)
+  probs_err = model_err.predict_proba(X_te).cpu().numpy()
 
-  print('=' * 76)
-  print(f'ConstructiveMultiFloorNet ({ds_name}) | Test AUC: {auc:.4f} | Test Acc: {acc:.2f}%')
-  print('=' * 76)
+  # 3. LightGBM Baseline
+  lgb_clf = lgb.LGBMClassifier(
+      n_estimators=300,
+      learning_rate=0.03,
+      num_leaves=15,
+      random_state=42,
+      verbose=-1,
+  )
+  lgb_clf.fit(
+      np.vstack([X_tr_raw, X_va_raw]), np.concatenate([y_tr, y_va])
+  )
+  probs_lgb = lgb_clf.predict_proba(X_te_raw)[:, 1]
+
+  print('=' * 82)
+  print(f'BENCHMARK ON {ds_name}:')
+  print('-' * 82)
+  print(
+      f'ConstructiveMultiFloorNet (Equal Weights)    | AUC:'
+      f' {roc_auc_score(y_te, probs_base):.4f} | Acc:'
+      f' {accuracy_score(y_te, probs_base > 0.5)*100:5.2f}%'
+  )
+  print(
+      f'ConstructiveMultiFloorNet (Error-Reweighted) | AUC:'
+      f' {roc_auc_score(y_te, probs_err):.4f} | Acc:'
+      f' {accuracy_score(y_te, probs_err > 0.5)*100:5.2f}%'
+  )
+  print(
+      f'LightGBM Gradient Boosting Baseline          | AUC:'
+      f' {roc_auc_score(y_te, probs_lgb):.4f} | Acc:'
+      f' {accuracy_score(y_te, probs_lgb > 0.5)*100:5.2f}%'
+  )
+  print('=' * 82)
 
 
 if __name__ == '__main__':
