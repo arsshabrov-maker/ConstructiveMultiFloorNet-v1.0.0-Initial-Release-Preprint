@@ -1,6 +1,7 @@
 import itertools
 import operator
 import numpy as np
+from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,27 +33,43 @@ class ConstructiveMultiFloorNet(nn.Module):
   """
     Constructive Multi-Floor Neural Boosting (`ConstructiveMultiFloorNet`):
       1. Grows neural depth floor by floor via beam search over feature subsets.
-      2. Preserves direct raw-feature passthrough at every new floor so deep blocks
-         can combine prior representations directly with original inputs.
-      3. Collects Top-K leaders from every floor (1-floor to N-floor architectures)
-         and fuses them via an L2-regularized meta-booster.
+      2. Preserves direct raw-feature passthrough at every new floor.
+      3. Reweights hard misclassified examples after each floor (AdaBoost-style
+         error focusing) so deeper floors specialize on difficult boundary cases.
+      4. Aggregates the Top-K leaders from every floor (1-floor to N-floor)
+         into a final L2-regularized multi-depth ensemble.
     """
 
-  def __init__(self, n_floors=3, top_k_per_floor=8, beam_candidates=32, seed=42):
+  def __init__(
+      self,
+      n_floors=3,
+      top_k_per_floor=8,
+      beam_candidates=32,
+      focus_power=2.5,
+      seed=42,
+  ):
     super().__init__()
     self.n_floors = n_floors
     self.top_k_per_floor = top_k_per_floor
     self.beam_candidates = beam_candidates
+    self.focus_power = focus_power
     self.seed = seed
 
     self.floor_models = nn.ModuleList()
     self.meta_booster = None
 
   def _train_candidate(
-      self, col_indices, pool_tr, y_tr_t, pool_va, y_va_np, cand_seed, epochs=55
+      self,
+      col_indices,
+      pool_tr,
+      y_tr_t,
+      w_tr,
+      pool_va,
+      y_va_np,
+      w_va_np,
+      cand_seed,
+      epochs=55,
   ):
-    from sklearn.metrics import roc_auc_score
-
     torch.manual_seed(cand_seed)
     device = pool_tr.device
     h_dim = min(12, max(6, len(col_indices) * 2))
@@ -63,7 +80,10 @@ class ConstructiveMultiFloorNet(nn.Module):
       net.train()
       opt.zero_grad()
       logits = net(pool_tr)
-      loss = F.binary_cross_entropy_with_logits(logits, y_tr_t)
+      raw_loss = F.binary_cross_entropy_with_logits(
+          logits, y_tr_t, reduction='none'
+      )
+      loss = (raw_loss * w_tr).mean()
       loss.backward()
       opt.step()
 
@@ -71,8 +91,8 @@ class ConstructiveMultiFloorNet(nn.Module):
     with torch.no_grad():
       va_logits = net(pool_va)
       va_probs = torch.sigmoid(va_logits).cpu().numpy()
-      va_auc = roc_auc_score(y_va_np, va_probs)
-    return va_auc, va_logits, net
+      va_score = roc_auc_score(y_va_np, va_probs, sample_weight=w_va_np)
+    return va_score, va_logits, net
 
   def fit(self, X_tr, y_tr, X_va, y_va):
     np.random.seed(self.seed)
@@ -82,6 +102,9 @@ class ConstructiveMultiFloorNet(nn.Module):
     y_tr_t = torch.as_tensor(y_tr, dtype=torch.float32, device=device)
     y_va_t = torch.as_tensor(y_va, dtype=torch.float32, device=device)
     y_va_np = y_va_t.cpu().numpy()
+
+    sample_weights_tr = torch.ones_like(y_tr_t)
+    sample_weights_va = torch.ones_like(y_va_t)
 
     pool_tr = X_tr.clone()
     pool_va = X_va.clone()
@@ -122,35 +145,38 @@ class ConstructiveMultiFloorNet(nn.Module):
           r_rand = int(np.random.choice(raw_indices))
           candidate_combos.append(lp + (r_rand,))
 
-      unique_combos = []
-      seen = set()
-      for c in candidate_combos:
-        key = tuple(sorted(c))
-        if key not in seen:
-          seen.add(key)
-          unique_combos.append(key)
+      unique_combos = list(dict.fromkeys(tuple(sorted(c)) for c in candidate_combos))
+      w_va_np = sample_weights_va.cpu().numpy()
 
       evaluated = []
       for idx_c, combo in enumerate(unique_combos):
-        auc_v, va_log, net_obj = self._train_candidate(
+        sc_v, va_log, net_obj = self._train_candidate(
             combo,
             pool_tr,
             y_tr_t,
+            sample_weights_tr,
             pool_va,
             y_va_np,
+            w_va_np,
             cand_seed=floor * 1000 + idx_c,
         )
-        evaluated.append((auc_v, combo, va_log, net_obj))
+        evaluated.append((sc_v, combo, va_log, net_obj))
 
       evaluated.sort(key=operator.itemgetter(0), reverse=True)
       winners = evaluated[: self.top_k_per_floor]
 
       floor_layer = nn.ModuleList()
       new_indices = []
+      floor_tr_preds = []
+      floor_va_preds = []
+
       for _, _, va_l, net_w in winners:
         net_w.eval()
         with torch.no_grad():
           tr_l = net_w(pool_tr)
+
+        floor_tr_preds.append(torch.sigmoid(tr_l))
+        floor_va_preds.append(torch.sigmoid(va_l))
 
         tr_norm = torch.tanh(tr_l * 0.5).unsqueeze(1)
         va_norm = torch.tanh(va_l * 0.5).unsqueeze(1)
@@ -165,6 +191,15 @@ class ConstructiveMultiFloorNet(nn.Module):
 
       self.floor_models.append(floor_layer)
       prev_floor_indices = new_indices
+
+      # Amplify sample weights on misclassified examples for the next floor
+      if self.focus_power > 0.0:
+        err_tr = torch.abs(y_tr_t - torch.stack(floor_tr_preds).mean(dim=0))
+        err_va = torch.abs(y_va_t - torch.stack(floor_va_preds).mean(dim=0))
+        sample_weights_tr = 1.0 + self.focus_power * (err_tr ** 1.5)
+        sample_weights_va = 1.0 + self.focus_power * (err_va ** 1.5)
+        sample_weights_tr = sample_weights_tr / sample_weights_tr.mean()
+        sample_weights_va = sample_weights_va / sample_weights_va.mean()
 
     meta_va_X = torch.stack(all_leaders_va, dim=1)
     torch.manual_seed(self.seed)
